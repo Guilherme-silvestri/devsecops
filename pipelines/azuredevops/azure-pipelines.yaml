@@ -1,0 +1,362 @@
+#name: 
+trigger:
+  branches:
+    include:
+      - develop
+      - master
+#variables for development  
+variables:  
+    - name: service_name
+      value: card
+    - name: tag
+      ${{ if eq(variables['Build.SourceBranchName'], 'develop') }}:
+        value: staging
+      ${{ elseif or(eq(variables['Build.SourceBranchName'], 'main'), eq(variables['Build.SourceBranchName'], 'master')) }}:  
+        value: latest
+    - name: TAG_DEV
+      value: develop
+    - name: DEPLOYMENT_NAME
+      value: card 
+    - name: AWS_CREDENTIALS
+      value: viewy.az.pipeline.prd
+    - name: AWS_REGION
+      value: sa-east-1   
+    - name: DOCKER_REGISTRY
+      value: 879473356390.dkr.ecr.sa-east-1.amazonaws.com    
+    - name: DOCKER_BUILDKIT
+      value: 0
+    - name: ARTIFACTFEED
+      value: "DMConta/python_artifacts"
+    - name: K8S_NAMESPACE
+      value: default
+    - name: POOL_PRE_DEPLOY
+      value: ubuntu-20.04
+    - group: ARGO_VARIABLES
+#variables for production      
+pool:
+  vmImage: $(POOL_PRE_DEPLOY)
+stages:
+  - stage: Build_Image_Service
+    jobs:
+      - job: Build_Process    
+        displayName: Docker Build
+        steps:
+          - checkout: self
+            clean: true
+            displayName: git checkout
+          - script: |
+              echo $(Build.SourceBranchName) 
+              echo $(tag)
+            displayName: validate tag and build sourcename 
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: $(AWS_CREDENTIALS)
+              regionName: $(AWS_REGION) 
+              scriptType: 'inline'
+              inlineScript: |
+                  #echo runaws
+                  aws ecr get-login-password | \
+                  docker login --username AWS --password-stdin $(DOCKER_REGISTRY)
+            env:
+                DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                REGION_NAME: ${{ variables.AWS_REGION }}
+            displayName: Docker Login on ECR    
+          - task: PipAuthenticate@1
+            inputs:
+              artifactFeeds: '$(ARTIFACTFEED)'
+              onlyAddExtraIndex: true
+            env:
+                ARTIFACTFEED: ${{ variables.ARTIFACTFEED }}
+            displayName: Authenticate with Artifact Feed
+          - script: |
+              url=$(PIP_EXTRA_INDEX_URL)
+              usertoken=${url:8}
+              usertoken=${usertoken%@pkgs*}
+              user="$(cut -d':' -f1 <<<"$usertoken")"
+              token="$(cut -d':' -f2 <<<"$usertoken")"
+              docker build --build-arg TOKEN_USER=$user --build-arg TOKEN_PASS=$token .
+            env:
+              DOCKER_BUILDKIT: ${{ variables.DOCKER_BUILDKIT }}
+              DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }} 
+              SERVICE_NAME: ${{ variables.service_name }}
+              TAG: ${{ variables.tag }}
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+            displayName: Docker build $(SERVICE_NAME)
+  - stage: Deployment_DEV
+    dependsOn: 
+      - Build_Image_Service
+    condition: and(succeeded('Build_Image_Service') , eq(lower(variables.tag),'staging'))
+    jobs:      
+      - deployment: Deploy_DEV
+        environment: Digital_Account_DEV
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+              - checkout: self
+                clean: true
+                displayName: git checkout
+              - script: |
+                  echo $(Build.SourceBranchName)
+                  echo $(tag)
+                displayName: validate tag and build sourcename
+              - task: AWSShellScript@1
+                inputs:
+                  awsCredentials: $(AWS_CREDENTIALS)
+                  regionName: $(AWS_REGION) 
+                  scriptType: 'inline'
+                  inlineScript: |
+                      #echo runaws
+                      aws ecr get-login-password | \
+                      docker login --username AWS --password-stdin $(DOCKER_REGISTRY)
+                env:
+                    DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                    AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                    REGION_NAME: ${{ variables.AWS_REGION }}
+                displayName: Docker Login on ECR
+              - task: PipAuthenticate@1
+                inputs:
+                  artifactFeeds: '$(ARTIFACTFEED)'
+                  onlyAddExtraIndex: true
+                env:
+                    ARTIFACTFEED: ${{ variables.ARTIFACTFEED }}
+                displayName: Authenticate with Artifact Feed
+              - script: |
+                  url=$(PIP_EXTRA_INDEX_URL)
+                  usertoken=${url:8}
+                  usertoken=${usertoken%@pkgs*}
+                  user="$(cut -d':' -f1 <<<"$usertoken")"
+                  token="$(cut -d':' -f2 <<<"$usertoken")"
+                  docker build \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(TAG) \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(Build.SourceVersion) \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(git rev-parse --short $BUILD_SOURCEVERSION) \
+                        --build-arg TOKEN_USER=$user --build-arg TOKEN_PASS=$token .
+                env:
+                  DOCKER_BUILDKIT: ${{ variables.DOCKER_BUILDKIT }}
+                  DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                  SERVICE_NAME: ${{ variables.service_name }}
+                  TAG: ${{ variables.tag }}
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                displayName: Docker build $(SERVICE_NAME)
+              - script: |
+                  listimages=$(docker images --format="{{.Repository}}:{{.Tag}}" | grep $(DOCKER_REGISTRY)/$(SERVICE_NAME))
+                  for image in $listimages
+                  do
+                  docker push ${image}
+                  done
+                env:
+                  DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                  SERVICE_NAME: ${{ variables.service_name }}
+                displayName: Push Image $(SERVICE_NAME)
+              - task: AWSShellScript@1
+                inputs:
+                  awsCredentials: $(AWS_CREDENTIALS)
+                  regionName: $(AWS_REGION) 
+                  scriptType: 'inline'
+                  inlineScript: |
+                      #echo runaws
+                      validateImage=$(aws ecr describe-images --repository-name $(DEPLOYMENT_NAME) --image-ids imageTag=$(Build.SourceVersion) --output text)
+                      if [[ "$validateImage" == *"$(TAG_DEV)"* ]]; then
+                        echo "Already has the tag"
+                      else
+                        MANIFEST=$(aws ecr batch-get-image --repository-name $(DEPLOYMENT_NAME) --image-ids imageTag=$(Build.SourceVersion) --output json | jq --raw-output --join-output '.images[0].imageManifest')
+                        aws ecr put-image --repository-name $(DEPLOYMENT_NAME) --image-tag $(TAG_DEV) --image-manifest "$MANIFEST"
+                      fi
+                env:
+                    DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                    AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                    REGION_NAME: ${{ variables.AWS_REGION }}
+                displayName: Add Develop Tag
+            deploy:
+              pool: 'AZ-LNX-K8S'
+              steps:
+              - script: |
+                  FILE=/tmp/argocd
+                  if [ -f "$FILE" ]; then
+                      echo "$FILE exists."
+                  else 
+                      echo "$FILE does not exist."
+                      curl -sSL -o /tmp/argocd $(ARGO_DOWNLOAD_URL)
+                      chmod +x /tmp/argocd          
+                  fi
+                displayName: ArgoCD Install
+              - script: |
+                  ArgoAPP='$(TAG_DEV)-$(DEPLOYMENT_NAME)'
+                  echo $ArgoAPP
+                  /tmp/argocd login $(ARGO_URL) --insecure --username $(ARGO_USER) --password $(ARGO_PWD) --grpc-web
+                  projeto=`/tmp/argocd app list | grep -q -w $ArgoAPP && echo ProjExiste`
+                  if [ $projeto == "ProjExiste" ]; then
+                      echo " This project already exists - $ArgoAPP"
+                  else 
+                      echo "Creating Project - $ArgoAPP"
+                      /tmp/argocd app create $ArgoAPP --repo $(GITOPS_URL) --path $(DEPLOYMENT_NAME) --revision $(TAG_DEV) --dest-namespace $(K8S_NAMESPACE) --project $(ARGO_NAMESPACE_DEV) --dest-server $(K8S_DEV) --values values-$(TAG_DEV).yaml --release-name $(DEPLOYMENT_NAME)
+                  fi
+                  /tmp/argocd app set $ArgoAPP --helm-set image.tag=$(Build.SourceVersion)
+                  /tmp/argocd app sync $ArgoAPP
+                displayName: ArgoCD Apply&Sync
+  - stage: Deployment_HML
+    dependsOn: 
+      - Deployment_DEV
+    condition: succeeded('Deployment_DEV')
+    jobs:      
+      - deployment: Deploy_HML
+        environment: Digital_Account_HML
+        strategy:
+          runOnce:
+            preDeploy:
+              steps:
+              - task: AWSShellScript@1
+                inputs:
+                  awsCredentials: $(AWS_CREDENTIALS)
+                  regionName: $(AWS_REGION) 
+                  scriptType: 'inline'
+                  inlineScript: |
+                      #echo runaws
+                      aws ecr get-login-password | \
+                      docker login --username AWS --password-stdin $(DOCKER_REGISTRY)
+                env:
+                    DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                    AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                    REGION_NAME: ${{ variables.AWS_REGION }}
+                displayName: Docker Login on ECR
+              - task: AWSShellScript@1
+                inputs:
+                  awsCredentials: $(AWS_CREDENTIALS)
+                  regionName: $(AWS_REGION) 
+                  scriptType: 'inline'
+                  inlineScript: |
+                      #echo runaws
+                      validateImage=$(aws ecr describe-images --repository-name $(DEPLOYMENT_NAME) --image-ids imageTag=$(Build.SourceVersion) --output text)
+                      if [[ "$validateImage" == *"$(TAG)"* ]]; then
+                        echo "Already has the tag"
+                      else
+                        MANIFEST=$(aws ecr batch-get-image --repository-name $(DEPLOYMENT_NAME) --image-ids imageTag=$(Build.SourceVersion) --output json | jq --raw-output --join-output '.images[0].imageManifest')
+                        aws ecr put-image --repository-name $(DEPLOYMENT_NAME) --image-tag $(TAG) --image-manifest "$MANIFEST"
+                      fi
+                env:
+                    DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                    AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                    REGION_NAME: ${{ variables.AWS_REGION }}
+                    TAG: ${{ variables.tag }}
+                displayName: Add Tag
+            deploy:
+              pool: 'AZ-LNX-K8S'
+              steps:
+              - script: |
+                  FILE=/tmp/argocd
+                  if [ -f "$FILE" ]; then
+                      echo "$FILE exists."
+                  else 
+                      echo "$FILE does not exist."
+                      curl -sSL -o /tmp/argocd $(ARGO_DOWNLOAD_URL)
+                      chmod +x /tmp/argocd          
+                  fi
+                displayName: ArgoCD Install
+              - script: |
+                  ArgoAPP='$(TAG)-$(DEPLOYMENT_NAME)'
+                  echo $ArgoAPP
+                  /tmp/argocd login $(ARGO_URL) --insecure --username $(ARGO_USER) --password $(ARGO_PWD) --grpc-web
+                  projeto=`/tmp/argocd app list | grep -q -w $ArgoAPP && echo ProjExiste`
+                  if [ $projeto == "ProjExiste" ]; then
+                      echo " This project already exists - $ArgoAPP"
+                  else 
+                      echo "Creating Project - $ArgoAPP"
+                      /tmp/argocd app create $ArgoAPP --repo $(GITOPS_URL) --path $(DEPLOYMENT_NAME) --revision $(TAG) --dest-namespace $(K8S_NAMESPACE) --project $(ARGO_NAMESPACE_HML) --dest-server $(K8S_HML) --values values-$(TAG).yaml --release-name $(DEPLOYMENT_NAME)
+                  fi
+                  /tmp/argocd app set $ArgoAPP --helm-set image.tag=$(Build.SourceVersion)
+                  /tmp/argocd app sync $ArgoAPP
+                env:
+                    TAG: ${{ variables.tag }}
+                displayName: ArgoCD Apply&Sync
+  - stage: Deployment_PRD
+    dependsOn: 
+      - Build_Image_Service
+    condition: and(succeeded('Build_Image_Service') , eq(lower(variables.tag),'latest'))
+    jobs:      
+    - deployment: Deploy_PRD
+      environment: Digital_Account_PRD
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - checkout: self
+                clean: true
+                displayName: git checkout
+              - script: |
+                  echo $(Build.SourceBranchName) 
+                  echo $(tag)
+                displayName: validate tag and build sourcename
+              - task: AWSShellScript@1
+                inputs:
+                  awsCredentials: $(AWS_CREDENTIALS)
+                  regionName: $(AWS_REGION) 
+                  scriptType: 'inline'
+                  inlineScript: |
+                      #echo runaws
+                      aws ecr get-login-password | \
+                      docker login --username AWS --password-stdin $(DOCKER_REGISTRY)
+                env:
+                    DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }}
+                    AWS_CREDENTIALS: ${{ variables.AWS_CREDENTIALS }}  
+                    REGION_NAME: ${{ variables.AWS_REGION }}
+                displayName: Docker Login on ECR 
+              - task: PipAuthenticate@1
+                inputs:
+                  artifactFeeds: '$(ARTIFACTFEED)'
+                  onlyAddExtraIndex: true
+                env:
+                    ARTIFACTFEED: ${{ variables.ARTIFACTFEED }}
+                displayName: Authenticate with Artifact Feed
+              - script: |
+                  url=$(PIP_EXTRA_INDEX_URL)
+                  usertoken=${url:8}
+                  usertoken=${usertoken%@pkgs*}
+                  user="$(cut -d':' -f1 <<<"$usertoken")"
+                  token="$(cut -d':' -f2 <<<"$usertoken")"
+                  docker build \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(TAG) \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(Build.SourceVersion) \
+                        -t $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(git rev-parse --short $BUILD_SOURCEVERSION) \
+                        --build-arg TOKEN_USER=$user --build-arg TOKEN_PASS=$token .
+                env:
+                  DOCKER_BUILDKIT: ${{ variables.DOCKER_BUILDKIT }}
+                  DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }} 
+                  SERVICE_NAME: ${{ variables.service_name }}
+                  TAG: ${{ variables.tag }}
+                  SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+                displayName: Docker build $(SERVICE_NAME)   
+              - script: |
+                  listimages=$(docker images --format="{{.Repository}}:{{.Tag}}" | grep $(DOCKER_REGISTRY)/$(SERVICE_NAME))
+                  for image in $listimages 
+                  do
+                  docker push ${image}
+                  done               
+                env:
+                  DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }} 
+                  SERVICE_NAME: ${{ variables.service_name }}
+                displayName: Push Image $(SERVICE_NAME)
+              - task: KubectlInstaller@0
+                displayName: Kubectl installer
+                inputs:
+                  kubectlVersion: 1.19.16
+              - task: Kubernetes@1
+                inputs:
+                  connectionType: 'Kubernetes Service Connection'
+                  kubernetesServiceEndpoint: 'k8s_prd_default'
+                  namespace: 'default'
+                  command: 'login'
+                displayName: K8s Login  
+              - task: Kubernetes@1
+                inputs:
+                  connectionType: Kubernetes Service Connection
+                  kubernetesServiceEndpoint: 'k8s_prd_default'
+                  namespace: 'default'
+                  command: set
+                  arguments: image deployments/$(DEPLOYMENT_NAME) $(DEPLOYMENT_NAME)=$(DOCKER_REGISTRY)/$(SERVICE_NAME):$(Build.SourceVersion)
+                env:
+                  DEPLOYMENT_NAME: ${{ variables.DEPLOYMENT_NAME }}
+                  DOCKER_REGISTRY: ${{ variables.DOCKER_REGISTRY }} 
+                  SERVICE_NAME: ${{ variables.service_name }}
+                displayName: Set image $(DOCKER_REGISTRY)/$(SERVICE_NAME):$(Build.SourceVersion) on deployment
